@@ -119,7 +119,13 @@ export default function App() {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [selectedChannel, setSelectedChannel] = useState(null);
   const [playerError, setPlayerError] = useState("");
+  const [playbackNeedsGesture, setPlaybackNeedsGesture] = useState(false);
+  const [playerRetrying, setPlayerRetrying] = useState(false);
+  const [playerRetryCount, setPlayerRetryCount] = useState(0);
   const [retryKey, setRetryKey] = useState(0);
+  const [qualityMode, setQualityMode] = useState("auto");
+  const [qualityAvailable, setQualityAvailable] = useState(false);
+  const hlsInstanceRef = useRef(null);
   const [recentChannels, setRecentChannels] = useState(() => {
     try { return JSON.parse(localStorage.getItem("streambox-recent") || "[]"); }
     catch { return []; }
@@ -163,76 +169,181 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedChannel || !videoRef.current) return undefined;
+
     const video = videoRef.current;
-    const url = selectedChannel.url;
+    const url = (selectedChannel.url || "").trim();
     let hls = null;
     let cancelled = false;
-    let recoveredMediaError = false;
+    let timeoutId = null;
+    let networkRetries = 0;
+    let mediaRecovered = false;
+    let usingHlsJs = false;
 
+    hlsInstanceRef.current = null;
+    setQualityAvailable(false);
+    setQualityMode("auto");
     setPlayerError("");
+    setPlaybackNeedsGesture(false);
+    setPlayerRetrying(false);
     video.pause();
     video.removeAttribute("src");
     video.load();
 
-    const showFailure = () => {
-      if (!cancelled) setPlayerError("This stream did not start. It may be offline, restricted by its provider, or require a supported stream format.");
+    const clearStartupTimer = () => {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      timeoutId = null;
     };
 
-    const startHls = () => {
-      if (!Hls.isSupported()) {
-        showFailure();
-        return;
+    const showFailure = (message) => {
+      if (cancelled) return;
+      clearStartupTimer();
+      setPlayerError(message || "This stream could not be played. It may be offline, blocked by its provider, or use an unsupported format.");
+    };
+
+    const startPlayback = () => {
+      if (cancelled) return;
+      video.play().then(() => {
+        if (!cancelled) setPlaybackNeedsGesture(false);
+      }).catch(() => {
+        // Browsers and Android TV devices often block autoplay until a user presses Play.
+        if (!cancelled) setPlaybackNeedsGesture(true);
+      });
+    };
+
+    const startNative = () => {
+      if (cancelled) return;
+      if (hls) {
+        hls.destroy();
+        hls = null;
       }
+      hlsInstanceRef.current = null;
+      setQualityAvailable(false);
+      usingHlsJs = false;
+      video.onerror = () => showFailure("The browser could not decode this stream. The source may be offline or use an unsupported video codec.");
+      video.src = url;
+      video.load();
+      startPlayback();
+    };
+
+    const canUseNativeHls = Boolean(video.canPlayType("application/vnd.apple.mpegurl"));
+    const isHls = /\.m3u8?(?:$|[?#])|m3u8/i.test(url);
+
+    video.addEventListener("playing", clearStartupTimer);
+    video.addEventListener("canplay", () => {
+      if (!usingHlsJs) clearStartupTimer();
+    });
+    video.addEventListener("error", () => {
+      if (cancelled || usingHlsJs) return;
+      showFailure("The video source failed to load. It may be offline, blocked, or incompatible with this browser.");
+    });
+
+    if (!url) {
+      showFailure("This playlist entry has no stream URL.");
+    } else if (isHls && Hls.isSupported()) {
+      usingHlsJs = true;
       hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
         capLevelToPlayerSize: true,
-        maxBufferLength: 20,
+        maxBufferLength: 30,
         backBufferLength: 30,
+        maxLoadingDelay: 4,
         manifestLoadingTimeOut: 20000,
+        manifestLoadingMaxRetry: 2,
         levelLoadingTimeOut: 20000,
+        levelLoadingMaxRetry: 2,
+        fragLoadingTimeOut: 20000,
+        fragLoadingMaxRetry: 2,
       });
-      hls.loadSource(url);
-      hls.attachMedia(video);
+
+      hlsInstanceRef.current = hls;
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        if (!cancelled) hls.loadSource(url);
+      });
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (!cancelled) video.play().catch(() => setPlayerError("Press Play on the video controls to start this channel."));
+        if (!cancelled) setQualityAvailable(hls.levels.some((level) => Number(level.height) > 0));
+        startPlayback();
       });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal || cancelled) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+          networkRetries += 1;
           hls.startLoad();
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recoveredMediaError) {
-          recoveredMediaError = true;
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
+          mediaRecovered = true;
           hls.recoverMediaError();
+          return;
+        }
+        // Safari and some TV browsers can play HLS natively even when hls.js fails.
+        if (canUseNativeHls) {
+          startNative();
         } else {
-          showFailure();
+          showFailure("The HLS stream could not load. It may be offline, require provider authorization, or block browser playback (CORS).");
         }
       });
-    };
-
-    const isHls = /\.m3u8?(?:[?#]|$)|m3u8/i.test(url);
-    if (isHls && Hls.isSupported()) {
-      startHls();
+      hls.attachMedia(video);
     } else {
-      video.src = url;
-      video.play().catch(() => {
-        if (!cancelled && Hls.isSupported() && !isHls) startHls();
-        else if (!cancelled) setPlayerError("Press Play on the video controls. If it still fails, this stream may be unavailable.");
-      });
-      video.onerror = () => {
-        if (!cancelled && Hls.isSupported() && !isHls) startHls();
-        else showFailure();
-      };
+      // Safari/iOS often supports HLS natively; other browsers use direct video URLs.
+      startNative();
     }
+
+    timeoutId = window.setTimeout(() => {
+      if (cancelled || !video.paused || video.readyState >= 3) return;
+
+      // Retry a slow/unresponsive channel twice automatically, then show a clear failure.
+      if (playerRetryCount < 2) {
+        const nextAttempt = playerRetryCount + 1;
+        setPlayerRetrying(true);
+        setPlayerError(`The channel has not started. Retrying automatically (${nextAttempt} of 2)…`);
+        timeoutId = window.setTimeout(() => {
+          if (!cancelled) {
+            setPlayerRetryCount(nextAttempt);
+            setRetryKey((value) => value + 1);
+          }
+        }, 1800);
+      } else {
+        setPlayerRetrying(false);
+        showFailure("This channel is unavailable after 3 connection attempts. The stream may be offline, blocked by its provider, or incompatible with this device. You can retry or go back to the channel list.");
+      }
+    }, 15000);
 
     return () => {
       cancelled = true;
-      if (hls) hls.destroy();
+      clearStartupTimer();
       video.pause();
       video.removeAttribute("src");
       video.load();
+      if (hls) hls.destroy();
+      if (hlsInstanceRef.current === hls) hlsInstanceRef.current = null;
+      video.onerror = null;
     };
   }, [selectedChannel, retryKey]);
+
+  function changeQuality(value) {
+    setQualityMode(value);
+    const hls = hlsInstanceRef.current;
+    if (!hls || !hls.levels?.length) return;
+    if (value === "auto") {
+      hls.currentLevel = -1;
+      return;
+    }
+    const targetHeight = Number(value);
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    hls.levels.forEach((level, index) => {
+      const height = Number(level.height) || 0;
+      if (!height) return;
+      const distance = Math.abs(height - targetHeight);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    });
+    if (bestIndex >= 0) hls.currentLevel = bestIndex;
+  }
 
   const filteredChannels = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -262,7 +373,11 @@ export default function App() {
     if (activeCategory === "All") setActiveCategory(getCategory(channel));
     setVisibleCount(PAGE_SIZE);
     setSelectedChannel(channel);
+    setQualityMode("auto");
+    setQualityAvailable(false);
     setPlayerError("");
+    setPlayerRetrying(false);
+    setPlayerRetryCount(0);
     setRecentChannels((previous) => {
       const next = [channel, ...previous.filter((item) => item.id !== channel.id)].slice(0, 10);
       try { localStorage.setItem("streambox-recent", JSON.stringify(next)); } catch { /* storage may be unavailable */ }
@@ -488,9 +603,28 @@ export default function App() {
             </div>
             <div className="video-container">
               <video ref={videoRef} controls autoPlay playsInline className="video-player" />
-              {playerError && <div className="player-error"><div className="error-icon">!</div><h3>Stream unavailable</h3><p>{playerError}</p><button className="hero-button focusable" type="button" onClick={() => { setPlayerError(""); setRetryKey((value) => value + 1); }}>RETRY STREAM</button></div>}
+              {playbackNeedsGesture && !playerError && <div className="player-error"><div className="error-icon">▶</div><h3>Ready to play</h3><p>Your device blocked automatic playback. Press the button below to start this channel.</p><button className="hero-button focusable" type="button" onClick={() => { const video = videoRef.current; if (!video) return; video.play().then(() => setPlaybackNeedsGesture(false)).catch(() => setPlayerError("Playback could not start. The stream may be unavailable, blocked, or incompatible with this device.")); }}>PLAY CHANNEL</button></div>}
+              {playerError && <div className="player-error"><div className="error-icon">{playerRetrying ? "↻" : "!"}</div><h3>{playerRetrying ? "Trying to connect" : "Stream unavailable"}</h3><p>{playerError}</p>{!playerRetrying && <button className="hero-button focusable" type="button" onClick={() => { setPlayerError(""); setPlaybackNeedsGesture(false); setPlayerRetrying(false); setPlayerRetryCount(0); setRetryKey((value) => value + 1); }}>RETRY STREAM</button>}</div>}
             </div>
-            <div className="player-footer"><span>{selectedChannel.group || getCategory(selectedChannel)}</span><span>STREAMBOX PLAYER</span></div>
+            <div className="player-footer">
+              <span>{selectedChannel.group || getCategory(selectedChannel)}</span>
+              <label className="quality-control">
+                <span>QUALITY</span>
+                <select
+                  className="focusable"
+                  value={qualityMode}
+                  onChange={(event) => changeQuality(event.target.value)}
+                  disabled={!qualityAvailable}
+                  aria-label="Video quality"
+                  title={qualityAvailable ? "Choose stream quality" : "Manual quality is available when this channel provides an HLS quality playlist"}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="720">720p</option>
+                  <option value="450">450p</option>
+                </select>
+              </label>
+              <span className="player-engine-note">{qualityAvailable ? "HLS QUALITY" : "QUALITY CONTROL UNAVAILABLE FOR THIS STREAM"}</span>
+            </div>
           </section>
         </div>
       )}
